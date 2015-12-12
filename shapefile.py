@@ -561,25 +561,26 @@ class Reader:
         Useful for large data sets."""
         return _ShapeRecord(shape=self.iterShapes(), record=self.iterRecords())
                 
-    def toJsonES(self, es_index, es_doc_type, chunk_size=1):
+    def toJsonForES(self, es_index, es_doc_type, chunk_size=1):
         """Call this to pull chunks of records from the
         sourc file. Good for passing to an ES helper."""
         actions = []
-        while actions.count < chunk_size:
-            actions.append(self.iterJson())
-        return actions
+        for shape in self.iterShapes():
+            rec = next(self.iterRecords())
+            atr = dict(zip(self.field_names, rec))
+            atr['Shape_Area'] = float(atr['Shape_Area'])
+            atr['Shape_Leng'] = float(atr['Shape_Leng'])
+            atr['UID'] = int(atr['Shape_Leng'])
 
-    def iterJsonES(self, es_index, es_doc_type):
-        """Gets one record iteratively and packages it
-        into an 'action' object."""
-        for sr in reader.iterShapeRecords():
-            atr = dict(zip(self.field_names, sr.record))
-            geom = sr.shape.__geo_interface__
-            
+            geom = shape.__geo_interface__
+
             doc = {"location": geom, "atr": atr}
-            id = hashlib.md5(dumps(doc)).hexdigest()
-            action = {'_index': es_index, '_type': es_doc_type, '_id': id,'_source': doc}
-            yield action
+            id = hashlib.md5(json.dumps(doc)).hexdigest()
+            action = {'_index': es_index, '_type': es_doc_type, '_id': id, '_source': doc}
+            actions.append(action)
+            if len(actions) >= chunk_size:
+                yield actions
+                actions = []
         
         
 class Writer:
@@ -1187,10 +1188,28 @@ def test():
     doctest.testfile("README.txt", verbose=1)
 
 if __name__ == "__main__":
-    """
-    Doctests are contained in the file 'README.txt'. This library was originally developed
-    using Python 2.3. Python 2.4 and above have some excellent improvements in the built-in
-    testing libraries but for now unit testing is done using what's available in
-    2.3.
-    """
-    test()
+
+    from elasticsearch import Elasticsearch, helpers
+
+    es = Elasticsearch()
+    count={'success':0,'failed':0}
+
+    if len(sys.argv) < 4:
+        print "usage: shapefile.py shapefile_base_name es_index es_doc_type"
+        sys.exit(status=ImportError)
+
+    shpfile = sys.argv[1]
+    es_index = sys.argv[2]
+    es_doc_type = sys.argv[3]
+
+    print "Converting & Importing"
+    # read the shapefile
+    reader = Reader(shpfile)
+    for actions in reader.toJsonForES(es_index, es_doc_type, 100):
+        try:
+            helpers.bulk(es, actions)
+            count['success'] += 100
+        except:
+            count['failed'] += 100
+            pass
+        print "{good} | {bad}".format(good=count['success'],bad=count['failed'])
