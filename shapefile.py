@@ -2,13 +2,12 @@
 shapefile.py
 Provides read and write support for ESRI Shapefiles.
 author: jlawhead<at>geospatialpython.com
-date: 2015/06/22
-version: 1.2.3
+date: 20130727
+version: 1.2.0
 Compatible with Python versions 2.4-3.x
-version changelog: Reader.iterShapeRecords() bugfix for Python 3
 """
 
-__version__ = "1.2.3"
+__version__ = "1.2.0"
 
 from struct import pack, unpack, calcsize, error
 import os
@@ -16,7 +15,8 @@ import sys
 import time
 import array
 import tempfile
-import itertools
+import hashlib
+import json
 
 #
 # Constants for shape types
@@ -39,9 +39,6 @@ PYTHON3 = sys.version_info[0] == 3
 
 if PYTHON3:
     xrange = range
-    izip = zip
-else:
-    from itertools import izip
 
 def b(v):
     if PYTHON3:
@@ -60,24 +57,15 @@ def b(v):
 
 def u(v):
     if PYTHON3:
-        # try/catch added 2014/05/07
-        # returned error on dbf of shapefile
-        # from www.naturalearthdata.com named
-        # "ne_110m_admin_0_countries".
-        # Just returning v as is seemed to fix
-        # the problem.  This function could
-        # be condensed further.
-        try:
-          if isinstance(v, bytes):
-              # For python 3 decode bytes to str.
-              return v.decode('utf-8')
-          elif isinstance(v, str):
-              # Already str.
-              return v
-          else:
-              # Error.
-              raise Exception('Unknown input type')
-        except: return v
+        if isinstance(v, bytes):
+            # For python 3 decode bytes to str.
+            return v.decode('utf-8')
+        elif isinstance(v, str):
+            # Already str.
+            return v
+        else:
+            # Error.
+            raise Exception('Unknown input type')
     else:
         # For python 2 assume str passed in and return str.
         return v
@@ -277,6 +265,8 @@ class Reader:
             self.__shpHeader()
         if self.dbf:
             self.__dbfHeader()
+        fields = self.fields[1:]
+        self.field_names = [field[0] for field in fields]
 
     def __getFileObj(self, f):
         """Checks to see if the requested shapefile file object is
@@ -467,8 +457,7 @@ class Reader:
             fieldDesc[1] = u(fieldDesc[1])
             self.fields.append(fieldDesc)
         terminator = dbf.read(1)
-        if terminator != b("\r"):
-            raise ShapefileException("Shapefile dbf header lacks expected terminator. (likely corrupt?)")
+        assert terminator == b("\r")
         self.fields.insert(0, ('DeletionFlag', 'C', 1, 0))
 
     def __recordFmt(self):
@@ -497,22 +486,18 @@ class Reader:
                 continue
             elif typ == "N":
                 value = value.replace(b('\0'), b('')).strip()
-                value = value.replace(b('*'), b(''))  # QGIS NULL is all '*' chars
                 if value == b(''):
-                    value = None
+                    value = 0
                 elif deci:
                     value = float(value)
                 else:
                     value = int(value)
             elif typ == b('D'):
-                if value.count(b('0')) == len(value):  # QGIS NULL is all '0' chars
-                    value = None
-                else:
-                    try:
-                        y, m, d = int(value[:4]), int(value[4:6]), int(value[6:8])
-                        value = [y, m, d]
-                    except:
-                        value = value.strip()
+                try:
+                    y, m, d = int(value[:4]), int(value[4:6]), int(value[6:8])
+                    value = [y, m, d]
+                except:
+                    value = value.strip()
             elif typ == b('L'):
                 value = (value in b('YyTt') and b('T')) or \
                                         (value in b('NnFf') and b('F')) or b('?')
@@ -570,14 +555,33 @@ class Reader:
         shapeRecords = []
         return [_ShapeRecord(shape=rec[0], record=rec[1]) \
                                 for rec in zip(self.shapes(), self.records())]
-
+    
     def iterShapeRecords(self):
-        """Returns a generator of combination geometry/attribute records for
-        all records in a shapefile."""
-        for shape, record in izip(self.iterShapes(), self.iterRecords()):
-            yield _ShapeRecord(shape=shape, record=record)
+        """Serves up shape+record objects as an iterator.
+        Useful for large data sets."""
+        return _ShapeRecord(shape=self.iterShapes(), record=self.iterRecords())
+                
+    def toJsonES(self, es_index, es_doc_type, chunk_size=1):
+        """Call this to pull chunks of records from the
+        sourc file. Good for passing to an ES helper."""
+        actions = []
+        while actions.count < chunk_size:
+            actions.append(self.iterJson())
+        return actions
 
-
+    def iterJsonES(self, es_index, es_doc_type):
+        """Gets one record iteratively and packages it
+        into an 'action' object."""
+        for sr in reader.iterShapeRecords():
+            atr = dict(zip(self.field_names, sr.record))
+            geom = sr.shape.__geo_interface__
+            
+            doc = {"location": geom, "atr": atr}
+            id = hashlib.md5(dumps(doc)).hexdigest()
+            action = {'_index': es_index, '_type': es_doc_type, '_id': id,'_source': doc}
+            yield action
+        
+        
 class Writer:
     """Provides write support for ESRI Shapefiles."""
     def __init__(self, shapeType=None):
@@ -914,10 +918,7 @@ class Writer:
                     value = str(value)[0].upper()
                 else:
                     value = str(value)[:size].ljust(size)
-                if len(value) != size:
-                    raise ShapefileException(
-                        "Shapefile Writer unable to pack incorrect sized value"
-                        " (size %d) into field '%s' (size %d)." % (len(value), fieldName, size))
+                assert len(value) == size
                 value = b(value)
                 f.write(value)
 
